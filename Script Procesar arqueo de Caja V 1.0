@@ -1,0 +1,288 @@
+// ==========================================
+// 1. TRIGGER AUTOMÁTICO (Se ejecuta al editar la hoja)
+// ==========================================
+function onEdit(e) {
+  if (!e) return;
+  
+  var sheet = e.range.getSheet();
+  if (sheet.getName() !== "Ventas") return;
+  
+  var filaModificada = e.range.getRow();
+  var columnaModificada = e.range.getColumn();
+  
+  if (filaModificada === 1) return;
+  
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var idxEstado = buscarIndiceColumna(headers, "Estado");
+  
+  if (idxEstado !== -1 && columnaModificada === (idxEstado + 1)) {
+    var idVentaIdx = buscarIndiceColumna(headers, "Id_Venta");
+    if (idVentaIdx !== -1) {
+      var idVenta = sheet.getRange(filaModificada, idVentaIdx + 1).getValue();
+      if (idVenta) {
+        Logger.log("⚡ [TRIGGER] Detectado cambio en 'Estado' para la venta ID: " + idVenta);
+        ejecutarFlujoVentaSecuencial(sheet, filaModificada, idVenta);
+      }
+    }
+  }
+}
+
+// ==========================================
+// 2. FUNCIÓN DE PRUEBA MANUAL (Para auditar con Filtro_caja_2)
+// ==========================================
+function probarManual() {
+  Logger.log("==================================================");
+  Logger.log("🔍 [PASO 1 INICIO] Leyendo la tabla 'Filtro_caja_2'...");
+  Logger.log("==================================================");
+  
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheetFiltro = ss.getSheetByName("Filtro_caja_2");
+  if (!sheetFiltro) {
+    Logger.log("❌ ERROR CRÍTICO: No se encontró la hoja 'Filtro_caja_2'.");
+    return;
+  }
+  
+  var datosFiltro = sheetFiltro.getDataRange().getValues();
+  if (datosFiltro.length < 2) {
+    Logger.log("❌ ERROR: La hoja 'Filtro_caja_2' está vacía.");
+    return;
+  }
+  
+  var headersFiltro = datosFiltro[0];
+  var idxIdVentaFiltro = buscarIndiceColumna(headersFiltro, "Id_Venta");
+  if (idxIdVentaFiltro === -1) {
+    Logger.log("❌ ERROR: No se encontró la columna 'Id_Venta' en el filtro.");
+    return;
+  }
+  
+  var idVentaBuscado = datosFiltro[1][idxIdVentaFiltro];
+  if (!idVentaBuscado) {
+    Logger.log("⚠️ ADVERTENCIA: La celda de Id_Venta en 'Filtro_caja_2' está vacía.");
+    return;
+  }
+  
+  var sheetVentas = ss.getSheetByName("Ventas");
+  var datosVentas = sheetVentas.getDataRange().getValues();
+  var headersVentas = datosVentas[0];
+  var idxIdVentaVentas = buscarIndiceColumna(headersVentas, "Id_Venta");
+  
+  var filaVentaEncontrada = -1;
+  for (var i = 1; i < datosVentas.length; i++) {
+    if (datosVentas[i][idxIdVentaVentas] == idVentaBuscado) {
+      filaVentaEncontrada = i + 1;
+      break;
+    }
+  }
+  
+  if (filaVentaEncontrada === -1) {
+    Logger.log("❌ ERROR: El Id_Venta '" + idVentaBuscado + "' no existe en la tabla Ventas.");
+    return;
+  }
+  
+  ejecutarFlujoVentaSecuencial(sheetVentas, filaVentaEncontrada, idVentaBuscado);
+}
+
+// ==========================================
+// FUNCIÓN AUXILIAR: BÚSQUEDA ROBUSTA DE COLUMNAS
+// ==========================================
+function buscarIndiceColumna(headers, nombreBuscado) {
+  var objetivo = nombreBuscado.toString().trim().toLowerCase();
+  for (var i = 0; i < headers.length; i++) {
+    if (headers[i].toString().trim().toLowerCase() === objetivo) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// ==========================================
+// 3. NÚCLEO DE CÁLCULO, VALIDACIÓN Y ARQUEO
+// ==========================================
+function ejecutarFlujoVentaSecuencial(sheetVentas, filaVenta, idVenta) {
+  
+  // Refrescar encabezados directamente de la primera fila
+  var headers = sheetVentas.getRange(1, 1, 1, sheetVentas.getLastColumn()).getValues()[0];
+  
+  var idxMedioPago = buscarIndiceColumna(headers, "Medio_de_pago");
+  var idxEfectivo  = buscarIndiceColumna(headers, "Efectivo");
+  var idxCambio    = buscarIndiceColumna(headers, "Cambio");
+  
+  if (idxMedioPago === -1 || idxEfectivo === -1 || idxCambio === -1) {
+    Logger.log("❌ ERROR: Faltan columnas base ('Medio_de_pago', 'Efectivo' o 'Cambio').");
+    return;
+  }
+  
+  var medioPago = sheetVentas.getRange(filaVenta, idxMedioPago + 1).getValue();
+  if (medioPago.toString().toLowerCase().indexOf("efect") === -1) {
+    Logger.log("⏹️ [DETENIDO] La venta no es en efectivo.");
+    return;
+  }
+  
+  // Denominaciones de ENTRADA (cant_...)
+  var denominacionesEntrada = [
+    { valor: 100000, col: "cant_100k" },
+    { valor: 50000,  col: "cant_50k" },
+    { valor: 20000,  col: "cant_20k" },
+    { valor: 10000,  col: "cant_10k" },
+    { valor: 5000,   col: "cant_5k" },
+    { valor: 2000,   col: "cant_2k" },
+    { valor: 1000,   col: "cant_1000m" },
+    { valor: 500,    col: "cant_500m" },
+    { valor: 200,    col: "cant_200m" },
+    { valor: 100,    col: "cant_100m" }
+  ];
+  
+  var efectivoCalculadoPorBilletes = 0;
+  for (var k = 0; k < denominacionesEntrada.length; k++) {
+    var itemEntrada = denominacionesEntrada[k];
+    var idxColCant = buscarIndiceColumna(headers, itemEntrada.col);
+    if (idxColCant !== -1) {
+      var cantidadIngresada = Number(sheetVentas.getRange(filaVenta, idxColCant + 1).getValue()) || 0;
+      if (cantidadIngresada > 0) {
+        efectivoCalculadoPorBilletes += (cantidadIngresada * itemEntrada.valor);
+      }
+    }
+  }
+  
+  var efectivoRegistrado = Number(sheetVentas.getRange(filaVenta, idxEfectivo + 1).getValue());
+  var efectivoFinal = (efectivoCalculadoPorBilletes > 0) ? efectivoCalculadoPorBilletes : efectivoRegistrado;
+  
+  if (efectivoFinal <= 0) {
+    Logger.log("❌ ERROR: Efectivo inválido.");
+    return;
+  }
+  
+  // Redondeo comercial
+  var cambioRegistrado = Number(sheetVentas.getRange(filaVenta, idxCambio + 1).getValue());
+  var cambioRedondeado = Math.ceil(cambioRegistrado / 100) * 100;
+  
+  // Desglose de salida (Dev_...)
+  var denominacionesSalida = [
+    { valor: 100000, colDev: "Dev_100k", colArqueo: "cant_100k" },
+    { valor: 50000,  colDev: "Dev_50k",  colArqueo: "cant_50k" },
+    { valor: 20000,  colDev: "Dev_20k",  colArqueo: "cant_20k" },
+    { valor: 10000,  colDev: "Dev_10k",  colArqueo: "cant_10k" },
+    { valor: 5000,   colDev: "Dev_5k",   colArqueo: "cant_5k" },
+    { valor: 2000,   colDev: "Dev_2k",   colArqueo: "cant_2k" },
+    { valor: 1000,   colDev: "Dev_1000m",colArqueo: "cant_1000m" },
+    { valor: 500,    colDev: "Dev_500m", colArqueo: "cant_500m" },
+    { valor: 200,    colDev: "Dev_200m", colArqueo: "cant_200m" },
+    { valor: 100,    colDev: "Dev_100m", colArqueo: "cant_100m" }
+  ];
+  
+  var restante = cambioRedondeado;
+  var desgloseCalculado = {};
+  
+  for (var j = 0; j < denominacionesSalida.length; j++) {
+    var itemSalida = denominacionesSalida[j];
+    var cantidadAEntregar = 0;
+    if (restante >= itemSalida.valor) {
+      cantidadAEntregar = Math.floor(restante / itemSalida.valor);
+      restante = restante % itemSalida.valor;
+    }
+    desgloseCalculado[itemSalida.colDev] = {
+      cantidad: cantidadAEntregar,
+      valor: itemSalida.valor,
+      colArqueo: itemSalida.colArqueo
+    };
+  }
+  
+  // Validación de stock en Arqueo_caja
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheetArqueo = ss.getSheetByName("Arqueo_caja");
+  if (!sheetArqueo) {
+    Logger.log("❌ ERROR: No se encontró la hoja 'Arqueo_caja'.");
+    return;
+  }
+  
+  var datosArqueo = sheetArqueo.getDataRange().getValues();
+  var headersArqueo = datosArqueo[0];
+  var filaArqueoReal = 2;
+  
+  var hayStockSuficiente = true;
+  for (var key in desgloseCalculado) {
+    var info = desgloseCalculado[key];
+    if (info.cantidad > 0) {
+      var idxArqueoCol = buscarIndiceColumna(headersArqueo, info.colArqueo);
+      if (idxArqueoCol !== -1) {
+        var stockDisponible = Number(sheetArqueo.getRange(filaArqueoReal, idxArqueoCol + 1).getValue()) || 0;
+        if (stockDisponible < info.cantidad) {
+          hayStockSuficiente = false;
+          Logger.log("❌ Fondeo insuficiente detectado en: " + info.colArqueo + " (Requiere: " + info.cantidad + ", Hay: " + stockDisponible + ")");
+        }
+      }
+    }
+  }
+  
+  // SI FALTA STOCK EN CAJA
+  if (!hayStockSuficiente) {
+    var mensajeError = "ALERTA: Stock insuficiente en caja para entregar el cambio, Verifique la cantidad de billetes y reintente la transaccion!!";
+    
+    // 1. Escribir Observaciones obligatoriamente
+    var idxObs = buscarIndiceColumna(headers, "Observaciones");
+    if (idxObs !== -1) {
+      var celdaObs = sheetVentas.getRange(filaVenta, idxObs + 1);
+      celdaObs.setValue(mensajeError);
+      celdaObs.setFontWeight("bold");
+      celdaObs.setFontColor("red");
+      SpreadsheetApp.flush(); // Forzar la actualización inmediata en la hoja
+      Logger.log("✅ Alerta escrita en la columna Observaciones (Col " + (idxObs + 1) + ")");
+    } else {
+      Logger.log("❌ ERROR: La columna 'Observaciones' no existe en la fila 1 de Ventas.");
+    }
+    
+    // 2. Revertir Estado a Pendiente
+    var idxEstado = buscarIndiceColumna(headers, "Estado");
+    if (idxEstado !== -1) {
+      sheetVentas.getRange(filaVenta, idxEstado + 1).setValue("Pendiente");
+      SpreadsheetApp.flush();
+      Logger.log("🔄 Estado devuelto a 'Pendiente'");
+    }
+    
+    return;
+  }
+  
+  // Limpiar Observaciones si la venta es exitosa
+  var idxObsExitosa = buscarIndiceColumna(headers, "Observaciones");
+  if (idxObsExitosa !== -1) {
+    var celdaObsEx = sheetVentas.getRange(filaVenta, idxObsExitosa + 1);
+    celdaObsEx.setValue("");
+    celdaObsEx.setFontWeight("normal");
+    celdaObsEx.setFontColor("black");
+  }
+  
+  // Escritura de vueltos y actualización de Arqueo_caja
+  for (var key in desgloseCalculado) {
+    var info = desgloseCalculado[key];
+    var idxColDev = buscarIndiceColumna(headers, key);
+    if (idxColDev !== -1) {
+      sheetVentas.getRange(filaVenta, idxColDev + 1).setValue(info.cantidad);
+    }
+    if (info.cantidad > 0) {
+      var idxArq = buscarIndiceColumna(headersArqueo, info.colArqueo);
+      if (idxArq !== -1) {
+        var stockActual = Number(sheetArqueo.getRange(filaArqueoReal, idxArq + 1).getValue()) || 0;
+        sheetArqueo.getRange(filaArqueoReal, idxArq + 1).setValue(stockActual - info.cantidad);
+      }
+    }
+  }
+  
+  // Sumar entradas cant_... al Arqueo_caja
+  for (var k = 0; k < denominacionesEntrada.length; k++) {
+    var itemEntrada = denominacionesEntrada[k];
+    var idxVentaCant = buscarIndiceColumna(headers, itemEntrada.col);
+    if (idxVentaCant !== -1) {
+      var cantEntrada = Number(sheetVentas.getRange(filaVenta, idxVentaCant + 1).getValue()) || 0;
+      if (cantEntrada > 0) {
+        var idxArqEntrada = buscarIndiceColumna(headersArqueo, itemEntrada.col);
+        if (idxArqEntrada !== -1) {
+          var stockActualEntrada = Number(sheetArqueo.getRange(filaArqueoReal, idxArqEntrada + 1).getValue()) || 0;
+          sheetArqueo.getRange(filaArqueoReal, idxArqEntrada + 1).setValue(stockActualEntrada + cantEntrada);
+        }
+      }
+    }
+  }
+  
+  SpreadsheetApp.flush();
+  Logger.log("✅ Proceso completado exitosamente.");
+}
