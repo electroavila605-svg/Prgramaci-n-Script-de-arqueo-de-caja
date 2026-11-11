@@ -1,0 +1,356 @@
+// ==========================================
+// FUNCIÓN AUXILIAR: BÚSQUEDA SEGURA DE COLUMNAS
+// ==========================================
+function buscarIndiceColumna(headers, nombreBuscado) {
+  var objetivo = nombreBuscado.toString().trim().toLowerCase();
+  for (var i = 0; i < headers.length; i++) {
+    if (headers[i].toString().trim().toLowerCase() === objetivo) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+// ==========================================
+// 1. TRIGGER AUTOMÁTICO (onEdit)
+// ==========================================
+function onEdit(e) {
+  if (!e) return;
+  var sheet = e.range.getSheet();
+  if (sheet.getName() !== "Ventas") return;
+  
+  var fila = e.range.getRow();
+  var columna = e.range.getColumn();
+  if (fila === 1) return;
+  
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var idxEstado = buscarIndiceColumna(headers, "Estado");
+  
+  if (idxEstado !== -1 && columna === (idxEstado + 1)) {
+    var idxId = buscarIndiceColumna(headers, "Id_Venta");
+    if (idxId !== -1) {
+      var idVenta = sheet.getRange(fila, idxId + 1).getValue();
+      if (idVenta) {
+        ejecutarFlujoVentaSecuencial(sheet, fila, headers, idVenta);
+      }
+    }
+  }
+}
+
+// ==========================================
+// 2. PRUEBA MANUAL CON FILTRO
+// ==========================================
+function probarManual() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheetFiltro = ss.getSheetByName("Filtro_caja_2");
+  if (!sheetFiltro) return;
+  
+  var datosFiltro = sheetFiltro.getDataRange().getValues();
+  if (datosFiltro.length < 2) return;
+  
+  var idVentaBuscado = datosFiltro[1][buscarIndiceColumna(datosFiltro[0], "Id_Venta")];
+  if (!idVentaBuscado) return;
+  
+  var sheetVentas = ss.getSheetByName("Ventas");
+  var datosVentas = sheetVentas.getDataRange().getValues();
+  var headersVentas = datosVentas[0];
+  var idxIdVentaVentas = buscarIndiceColumna(headersVentas, "Id_Venta");
+  
+  var filaVentaEncontrada = -1;
+  for (var i = 1; i < datosVentas.length; i++) {
+    if (datosVentas[i][idxIdVentaVentas] == idVentaBuscado) {
+      filaVentaEncontrada = i + 1;
+      break;
+    }
+  }
+  
+  if (filaVentaEncontrada !== -1) {
+    ejecutarFlujoVentaSecuencial(sheetVentas, filaVentaEncontrada, headersVentas, idVentaBuscado);
+  }
+}
+
+// ==========================================
+// 3. NÚCLEO PRINCIPAL CON LECTURA REAL DEL PAGO DEL CLIENTE
+// ==========================================
+function ejecutarFlujoVentaSecuencial(sheetVentas, filaVenta, headers, idVenta) {
+  var idxMedio = buscarIndiceColumna(headers, "Medio_de_pago");
+  var idxEfectivo = buscarIndiceColumna(headers, "Efectivo");
+  var idxCambio = buscarIndiceColumna(headers, "Cambio");
+  
+  if (idxMedio === -1 || idxEfectivo === -1 || idxCambio === -1) return;
+  
+  var medioPago = sheetVentas.getRange(filaVenta, idxMedio + 1).getValue();
+  if (medioPago.toString().toLowerCase().indexOf("efect") === -1) return;
+  
+  // Denominaciones de entrada (cant_...)
+  var denoEntrada = [
+    { valor: 100000, col: "cant_100k" }, { valor: 50000, col: "cant_50k" },
+    { valor: 20000, col: "cant_20k" }, { valor: 10000, col: "cant_10k" },
+    { valor: 5000, col: "cant_5k" }, { valor: 2000, col: "cant_2k" },
+    { valor: 1000, col: "cant_1000m" }, { valor: 500, col: "cant_500m" },
+    { valor: 200, col: "cant_200m" }, { valor: 100, col: "cant_100m" }
+  ];
+  
+  var efectivoBilletes = 0;
+  var detallePagoClienteTexto = [];
+  for (var k = 0; k < denoEntrada.length; k++) {
+    var idx = buscarIndiceColumna(headers, denoEntrada[k].col);
+    if (idx !== -1) {
+      var cant = Number(sheetVentas.getRange(filaVenta, idx + 1).getValue()) || 0;
+      if (cant > 0) {
+        efectivoBilletes += (cant * denoEntrada[k].valor);
+        detallePagoClienteTexto.push(cant + " un. de $" + denoEntrada[k].valor.toLocaleString());
+      }
+    }
+  }
+  
+  var efectivoReg = Number(sheetVentas.getRange(filaVenta, idxEfectivo + 1).getValue());
+  var efectivoFinal = (efectivoBilletes > 0) ? efectivoBilletes : efectivoReg;
+  if (efectivoFinal <= 0) return;
+  
+  var cambioReg = Number(sheetVentas.getRange(filaVenta, idxCambio + 1).getValue());
+  var cambioRedondeado = Math.ceil(cambioReg / 100) * 100;
+  
+  // Denominaciones de salida (Dev_...)
+  var denoSalida = [
+    { valor: 100000, colDev: "Dev_100k", colArqueo: "cant_100k" },
+    { valor: 50000, colDev: "Dev_50k", colArqueo: "cant_50k" },
+    { valor: 20000, colDev: "Dev_20k", colArqueo: "cant_20k" },
+    { valor: 10000, colDev: "Dev_10k", colArqueo: "cant_10k" },
+    { valor: 5000, colDev: "Dev_5k", colArqueo: "cant_5k" },
+    { valor: 2000, colDev: "Dev_2k", colArqueo: "cant_2k" },
+    { valor: 1000, colDev: "Dev_1000m", colArqueo: "cant_1000m" },
+    { valor: 500, colDev: "Dev_500m", colArqueo: "cant_500m" },
+    { valor: 200, colDev: "Dev_200m", colArqueo: "cant_200m" },
+    { valor: 100, colDev: "Dev_100m", colArqueo: "cant_100m" }
+  ];
+  
+  // Leer stock actual de Arqueo_caja
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheetArqueo = ss.getSheetByName("Arqueo_caja");
+  if (!sheetArqueo) return;
+  
+  var datosArqueo = sheetArqueo.getDataRange().getValues();
+  var headersArqueo = datosArqueo[0];
+  
+  var stockActualMap = {};
+  for (var i = 0; i < denoSalida.length; i++) {
+    var colArq = denoSalida[i].colArqueo;
+    var idxA = buscarIndiceColumna(headersArqueo, colArq);
+    stockActualMap[colArq] = (idxA !== -1) ? (Number(sheetArqueo.getRange(2, idxA + 1).getValue()) || 0) : 0;
+  }
+  
+  // ==========================================================
+  // PASO 1: CASO A (Stock Directo incluyendo el efectivo que pagó el cliente)
+  // ==========================================================
+  var stockSimulado = Object.assign({}, stockActualMap);
+  
+  // El dinero que paga el cliente entra virtualmente a la caja para el cálculo
+  for (var k = 0; k < denoEntrada.length; k++) {
+    var ent = denoEntrada[k];
+    var idxEntVentas = buscarIndiceColumna(headers, ent.col);
+    if (idxEntVentas !== -1) {
+      var cantEnt = Number(sheetVentas.getRange(filaVenta, idxEntVentas + 1).getValue()) || 0;
+      if (cantEnt > 0) {
+        stockSimulado[ent.col] = (stockSimulado[ent.col] || 0) + cantEnt;
+      }
+    }
+  }
+  
+  var restanteSim = cambioRedondeado;
+  var hayStockDirecto = true;
+  var desgloseDirecto = {};
+  
+  for (var j = 0; j < denoSalida.length; j++) {
+    var item = denoSalida[j];
+    var deseado = 0;
+    if (restanteSim >= item.valor) {
+      deseado = Math.floor(restanteSim / item.valor);
+      restanteSim = restanteSim % item.valor;
+    }
+    var disponible = stockSimulado[item.colArqueo] || 0;
+    var aEntregar = Math.min(deseado, disponible);
+    if (aEntregar < deseado) {
+      hayStockDirecto = false;
+    }
+    stockSimulado[item.colArqueo] = disponible - aEntregar;
+    desgloseDirecto[item.colDev] = aEntregar;
+  }
+  
+  var desgloseFinal = {};
+  var usoDesgloseGrande = false;
+  var infoBilleteGrandeUsado = null;
+  var vueltoEntregadoConExito = false;
+  
+  if (hayStockDirecto) {
+    desgloseFinal = desgloseDirecto;
+    vueltoEntregadoConExito = true;
+  } else {
+    // ==========================================================
+    // PASO 2: CASO B (Desglose de billete mayor si el stock directo no alcanza)
+    // ==========================================================
+    for (var b = 0; b < denoSalida.length; b++) {
+      var candidato = denoSalida[b];
+      if (candidato.valor >= cambioRedondeado && stockActualMap[candidato.colArqueo] > 0) {
+        var stockSimuladoCasoB = Object.assign({}, stockActualMap);
+        stockSimuladoCasoB[candidato.colArqueo] -= 1;
+        
+        var simulacionExitosaB = true;
+        var desgloseTemporalB = {};
+        for(var z=0; z<denoSalida.length; z++) { desgloseTemporalB[denoSalida[z].colDev] = 0; }
+        
+        var restanteB = cambioRedondeado;
+        for (var m = 0; m < denoSalida.length; m++) {
+          var itemB = denoSalida[m];
+          var deseadoB = 0;
+          if (restanteB >= itemB.valor) {
+            deseadoB = Math.floor(restanteB / itemB.valor);
+            restanteB = restanteB % itemB.valor;
+          }
+          var dispB = stockSimuladoCasoB[itemB.colArqueo] ||0;
+          if (dispB >= deseadoB) {
+            stockSimuladoCasoB[itemB.colArqueo] -= deseadoB;
+            desgloseTemporalB[itemB.colDev] = deseadoB;
+          } else {
+            simulacionExitosaB = false;
+            break;
+          }
+        }
+        
+        if (simulacionExitosaB) {
+          usoDesgloseGrande = true;
+          infoBilleteGrandeUsado = candidato;
+          desgloseFinal = desgloseTemporalB;
+          vueltoEntregadoConExito = true;
+          break;
+        }
+      }
+    }
+  }
+  
+  // ==========================================================
+  // PASO 3: SI NO HAY STOCK -> ALERTA CON CÁLCULO REAL DEL FALTANTE
+  // ==========================================================
+  if (!vueltoEntregadoConExito) {
+    
+    // Calcular exactamente qué billetes faltan para entregar el cambio considerando el pago del cliente
+    var restanteDef = cambioRedondeado;
+    var deficitTexto = [];
+    var stockConPago = Object.assign({}, stockActualMap);
+    
+    for (var k = 0; k < denoEntrada.length; k++) {
+      var ent = denoEntrada[k];
+      var idxEntVentas = buscarIndiceColumna(headers, ent.col);
+      if (idxEntVentas !== -1) {
+        var cantEnt = Number(sheetVentas.getRange(filaVenta, idxEntVentas + 1).getValue()) || 0;
+        if (cantEnt > 0) {
+          stockConPago[ent.col] = (stockConPago[ent.col] || 0) + cantEnt;
+        }
+      }
+    }
+    
+    for (var j = 0; j < denoSalida.length; j++) {
+      var itemD = denoSalida[j];
+      var deseadoD = 0;
+      if (restanteDef >= itemD.valor) {
+        deseadoD = Math.floor(restanteDef / itemD.valor);
+        restanteDef = restanteDef % itemD.valor;
+      }
+      var dispD = stockConPago[itemD.colArqueo] || 0;
+      var entregarD = Math.min(deseadoD, dispD);
+      var faltaD = deseadoD - entregarD;
+      
+      if (faltaD > 0) {
+        deficitTexto.push("• " + faltaD + " un. de " + itemD.colArqueo.replace("cant_", "") + " ($" + itemD.valor.toLocaleString() + ")");
+      }
+      stockConPago[itemD.colArqueo] = Math.max(0, dispD - deseadoD);
+    }
+    
+    var textoPagoInfo = detallePagoClienteTexto.length > 0 ? detallePagoClienteTexto.join(", ") : "$" + efectivoFinal.toLocaleString();
+    
+    var textoAlerta = "ALERTA: Stock insuficiente en caja para entregar el cambio exacto.\n" +
+                      "• El cliente pagó con: " + textoPagoInfo + "\n" +
+                      "• Cambio requerido: $" + cambioRedondeado.toLocaleString() + "\n\n" +
+                      "🔄 Billetes y monedas exactos que faltan en la gaveta para completar el vuelto:\n" +
+                      deficitTexto.join("\n") + "\n\n" +
+                      "💡 Sugerencia: Acuda a Caja Mayor a cambiar efectivo para conseguir estas denominaciones menores, reabastezca la gaveta y reintente!!";
+    
+    var idxObs = buscarIndiceColumna(headers, "Observaciones");
+    if (idxObs !== -1) {
+      var celdaObs = sheetVentas.getRange(filaVenta, idxObs + 1);
+      celdaObs.setValue(textoAlerta);
+      celdaObs.setFontWeight("bold");
+      celdaObs.setFontColor("red");
+    }
+    
+    var idxEst = buscarIndiceColumna(headers, "Estado");
+    if (idxEst !== -1) {
+      sheetVentas.getRange(filaVenta, idxEst + 1).setValue("Pendiente");
+    }
+    
+    SpreadsheetApp.flush();
+    return;
+  }
+  
+  // ==========================================================
+  // PASO 4: EJECUCIÓN EXITOSA (Actualizar Arqueo y Limpiar Observaciones)
+  // ==========================================================
+  var idxObsClean = buscarIndiceColumna(headers, "Observaciones");
+  if (idxObsClean !== -1) {
+    var celdaClean = sheetVentas.getRange(filaVenta, idxObsClean + 1);
+    celdaClean.setValue("");
+    celdaClean.setFontWeight("normal");
+    celdaClean.setFontColor("black");
+  }
+  
+  for (var key in desgloseFinal) {
+    var cantidadFinal = desgloseFinal[key];
+    var idxDev = buscarIndiceColumna(headers, key);
+    if (idxDev !== -1) {
+      sheetVentas.getRange(filaVenta, idxDev + 1).setValue(cantidadFinal);
+    }
+  }
+  
+  for (var keyDev in desgloseFinal) {
+    var cantSalida = desgloseFinal[keyDev];
+    if (cantSalida > 0) {
+      for (var m = 0; m < denoSalida.length; m++) {
+        if (denoSalida[m].colDev === keyDev) {
+          var colArqAsociada = denoSalida[m].colArqueo;
+          var idxArq = buscarIndiceColumna(headersArqueo, colArqAsociada);
+          if (idxArq !== -1) {
+            var stockAct = Number(sheetArqueo.getRange(2, idxArq + 1).getValue()) || 0;
+            sheetArqueo.getRange(2, idxArq + 1).setValue(Math.max(0, stockAct - cantSalida));
+          }
+          break;
+        }
+      }
+    }
+  }
+  
+  if (usoDesgloseGrande && infoBilleteGrandeUsado) {
+    var idxArqGrande = buscarIndiceColumna(headersArqueo, infoBilleteGrandeUsado.colArqueo);
+    if (idxArqGrande !== -1) {
+      var stockGrandeAct = Number(sheetArqueo.getRange(2, idxArqGrande + 1).getValue()) || 0;
+      sheetArqueo.getRange(2, idxArqGrande + 1).setValue(Math.max(0, stockGrandeAct - 1));
+    }
+  }
+  
+  for (var k = 0; k < denoEntrada.length; k++) {
+    var ent = denoEntrada[k];
+    var idxEntVentas = buscarIndiceColumna(headers, ent.col);
+    if (idxEntVentas !== -1) {
+      var cantEnt = Number(sheetVentas.getRange(filaVenta, idxEntVentas + 1).getValue()) || 0;
+      if (cantEnt > 0) {
+        var idxArqEnt = buscarIndiceColumna(headersArqueo, ent.col);
+        if (idxArqEnt !== -1) {
+          var stockEnt = Number(sheetArqueo.getRange(2, idxArqEnt + 1).getValue()) || 0;
+          sheetArqueo.getRange(2, idxArqEnt + 1).setValue(stockEnt + cantEnt);
+        }
+      }
+    }
+  }
+  
+  SpreadsheetApp.flush();
+  Logger.log("✅ Proceso exitoso leyendo correctamente el efectivo ingresado por el cliente.");
+}
