@@ -1,0 +1,3 @@
+- **Cero Mezcla Patrimonial:** Eliminación definitiva de la "cuenta común". Separación estricta entre capital operativo del negocio y finanzas personales.
+- **Distribución Post-Cierre:** Ningún fondo se reparte en tiempo real durante la operación diurna. Toda la distribución matemática del dinero ocurre *después* de que el arqueo diario de caja se encuentre en estado `CERRADO`.
+- **Protección de Liquidez:** El dinero en caja durante el día permanece 100% disponible para emergencias operativas o reabastecimiento rápido de inventario.
