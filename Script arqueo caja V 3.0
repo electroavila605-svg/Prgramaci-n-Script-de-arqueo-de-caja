@@ -1,0 +1,266 @@
+Estr script ya está entendiendo la lógica de entrada y salida de dinero y la lectura de la tabla arqueo de caja, así como las 
+las equivalencias de las denominaciones.
+
+Tiene las siguientes funciones:
+1. Función de verificaión del stock de billetes y monedas
+2. Cálculos que indican si hay stock suficiente en la caja física para devolerel cambio al cliente
+3. Mensaje de error con idicaciones de como cambiar el dinero
+4. En el escnario que existe stock en la caja, realiza la suma y resta de las denomiaciones de forma adecuada.
+
+Próximas tareas planteadas:
+
+1. Intentar conectar el script con un bot. 
+2. si la prueba con el bot funciona, intentar optimizar el script para que corra de forma más fluida.
+
+Notas de la versión: 
+
+Estamos en la versión 3.0
+
+Script V3.0 Completo para copiar y pegar 
+
+// ==========================================
+// MAPA GLOBAL DE DENOMINACIONES
+// ==========================================
+const MAPA_DENOMS = [
+  { label: "$100.000", valor: 100000, colCant: "cant_100k",  colDev: "Dev_100k"  },
+  { label: "$50.000",  valor: 50000,  colCant: "cant_50k",   colDev: "Dev_50k"   },
+  { label: "$20.000",  valor: 20000,  colCant: "cant_20k",   colDev: "Dev_20k"   },
+  { label: "$10.000",  valor: 10000,  colCant: "cant_10k",   colDev: "Dev_10k"   },
+  { label: "$5.000",   valor: 5000,   colCant: "cant_5k",    colDev: "Dev_5k"    },
+  { label: "$2.000",   valor: 2000,   colCant: "cant_2k",    colDev: "Dev_2k"    },
+  { label: "$1.000",   valor: 1000,   colCant: "cant_1000m", colDev: "Dev_1000m" },
+  { label: "$500",     valor: 500,    colCant: "cant_500m",  colDev: "Dev_500m"  },
+  { label: "$200",     valor: 200,    colCant: "cant_200m",  colDev: "Dev_200m"  },
+  { label: "$100",     valor: 100,    colCant: "cant_100m",  colDev: "Dev_100m"  }
+];
+
+// ==========================================
+// FUNCIÓN PRINCIPAL: OPERACIÓN COMPLETA
+// ==========================================
+function probarOperacionCompleta() {
+  const ID_SPREADSHEET = "1NDOgowtX4icTF6qJhgUAmAYaTsQl1AA6uzHbD4Qknks";
+  const ss = SpreadsheetApp.openById(ID_SPREADSHEET);
+  
+  Logger.log("==================================================================");
+  Logger.log("🚀 INICIO DE TRAZA: AUDITORÍA Y ARQUEO DE CAJA PASO A PASO");
+  Logger.log("==================================================================");
+
+  // FASE 1: ARQUEO DE CAJA
+  const hojaA = ss.getSheetByName("Arqueo_caja");
+  if (!hojaA) { Logger.log("❌ ERROR: No se encontró la hoja 'Arqueo_caja'."); return; }
+  const datosA = hojaA.getDataRange().getValues();
+  if (datosA.length < 2) { Logger.log("❌ ERROR: La hoja 'Arqueo_caja' no tiene datos."); return; }
+  const colA = mapaEncabezados_(datosA[0]);
+  const ultimaFilaArqueo = datosA[datosA.length - 1];
+
+  const stockCaja = {};
+  MAPA_DENOMS.forEach(d => {
+    const idxCant = colA[d.colCant.toLowerCase()];
+    stockCaja[d.colCant] = (idxCant !== undefined) ? (Number(ultimaFilaArqueo[idxCant]) || 0) : 0;
+  });
+
+  // FASE 2: LECTURA DE COLA (Filtro_caja_2)
+  const hojaFiltro = ss.getSheetByName("Filtro_caja_2");
+  if (!hojaFiltro) { Logger.log("❌ ERROR: No se encontró la hoja 'Filtro_caja_2'."); return; }
+  const datosF = hojaFiltro.getDataRange().getValues();
+  if (datosF.length < 2) { Logger.log("❌ ERROR: La hoja 'Filtro_caja_2' está vacía."); return; }
+  const colF = mapaEncabezados_(datosF[0]);
+  const ultimaFilaFiltro = datosF[datosF.length - 1];
+  const idVentaBuscado = String(ultimaFilaFiltro[colF["id_venta"]] || "").trim();
+
+  // FASE 3: BÚSQUEDA EN VENTAS
+  const hojaVentas = ss.getSheetByName("Ventas");
+  if (!hojaVentas) { Logger.log("❌ ERROR: No se encontró la hoja 'Ventas'."); return; }
+  const datosV = hojaVentas.getDataRange().getValues();
+  if (datosV.length < 2) { Logger.log("❌ ERROR: La hoja 'Ventas' está vacía."); return; }
+  const colV = mapaEncabezados_(datosV[0]);
+  let filaVentaIdx = -1;
+  for (let r = 1; r < datosV.length; r++) {
+    if (String(datosV[r][colV["id_venta"]] || "").trim() === idVentaBuscado) {
+      filaVentaIdx = r;
+      break;
+    }
+  }
+
+  if (filaVentaIdx === -1) {
+    Logger.log("  ❌ RESULTADO: El Id_venta '" + idVentaBuscado + "' NO existe en la tabla Ventas.");
+    return;
+  }
+
+  const filaVenta = datosV[filaVentaIdx];
+  const idxObservaciones = colV["observaciones"];
+
+  let totalDevueltas = 0;
+  MAPA_DENOMS.forEach(d => {
+    const idxDev = colV[d.colDev.toLowerCase()];
+    const unidadesDev = (idxDev !== undefined) ? (Number(filaVenta[idxDev]) || 0) : 0;
+    totalDevueltas += (unidadesDev * d.valor);
+  });
+
+  // FASE 4: VALIDACIÓN CRUZADA DE STOCK
+  let stockSuficienteGeneral = true;
+  MAPA_DENOMS.forEach(d => {
+    const idxDev = colV[d.colDev.toLowerCase()];
+    const unidadesDevRequeridas = (idxDev !== undefined) ? (Number(filaVenta[idxDev]) || 0) : 0;
+    if (unidadesDevRequeridas > 0) {
+      const unidadesEnCaja = stockCaja[d.colCant] || 0;
+      if (unidadesEnCaja < unidadesDevRequeridas) {
+        stockSuficienteGeneral = false;
+      }
+    }
+  });
+
+  if (stockSuficienteGeneral) {
+    Logger.log("  ✅ VEREDICTO FINAL: STOCK SUFICIENTE. Procesando afectación contable...");
+    
+    // Limpiar observaciones si existían
+    if (idxObservaciones !== undefined) {
+      hojaVentas.getRange(filaVentaIdx + 1, idxObservaciones + 1).setValue("");
+    }
+
+    // FASE 6: APLICAR CAMBIOS DIRECTAMENTE SOBRE "Operacion y control"
+    aplicarAfectacionCaja_(ss, hojaA, colA, stockCaja, filaVenta, colV, idVentaBuscado);
+
+  } else {
+    Logger.log("  ⛔ VEREDICTO FINAL: STOCK INSUFICIENTE. Generando alerta en Observaciones.");
+    
+    let billeteAportado = null;
+    for (let i = MAPA_DENOMS.length - 1; i >= 0; i--) {
+      let d = MAPA_DENOMS[i];
+      if ((stockCaja[d.colCant] || 0) > 0 && d.valor >= totalDevueltas) {
+        billeteAportado = d;
+        break;
+      }
+    }
+    if (!billeteAportado) {
+      for (let i = 0; i < MAPA_DENOMS.length; i++) {
+        let d = MAPA_DENOMS[i];
+        if ((stockCaja[d.colCant] || 0) > 0) {
+          billeteAportado = d;
+          break;
+        }
+      }
+    }
+
+    let mensajeObservacion = "Stock de caja insuficiente.\n" +
+                             "1. Retire de la caja para cambiar:\n" +
+                             "   * 1 unidad de " + billeteAportado.label + " ($" + billeteAportado.valor.toLocaleString('es-CO') + " COP)\n" +
+                             "2. Vaya a la caja mayor y solicite el cambio optimizado en menudos (Minimizando piezas):\n";
+
+    MAPA_DENOMS.forEach(d => {
+      let idxDev = colV[d.colDev.toLowerCase()];
+      let cantDev = (idxDev !== undefined) ? (Number(filaVenta[idxDev]) || 0) : 0;
+      if (cantDev > 0) {
+        mensajeObservacion += "   - " + cantDev + " unidad(es) de " + d.label + "\n";
+      }
+    });
+
+    let restoExcedente = billeteAportado.valor - totalDevueltas;
+    if (restoExcedente > 0) {
+      MAPA_DENOMS.forEach(d => {
+        if (d.valor >= billeteAportado.valor) return;
+        if (restoExcedente <= 0) return;
+        let cantEx = Math.floor(restoExcedente / d.valor);
+        if (cantEx > 0) {
+          mensajeObservacion += "   - " + cantEx + " unidad(es) de " + d.label + "\n";
+          restoExcedente -= (cantEx * d.valor);
+        }
+      });
+    }
+
+    mensajeObservacion += "   para completar un total de $" + billeteAportado.valor.toLocaleString('es-CO') + " COP\n\n" +
+                          "3. Entregue las siguientes cantidades al cliente:\n";
+
+    MAPA_DENOMS.forEach(d => {
+      let idxDev = colV[d.colDev.toLowerCase()];
+      let cantCli = (idxDev !== undefined) ? (Number(filaVenta[idxDev]) || 0) : 0;
+      if (cantCli > 0) {
+        mensajeObservacion += "   - " + cantCli + " unidad(es) de " + d.label + "\n";
+      }
+    });
+
+    mensajeObservacion += "   Para sumar un total de $" + totalDevueltas.toLocaleString('es-CO') + " COP\n" +
+                          "4. El sobrante regresa al cajón y actualice el Arqueo de Caja.";
+
+    if (idxObservaciones !== undefined) {
+      hojaVentas.getRange(filaVentaIdx + 1, idxObservaciones + 1).setValue(mensajeObservacion);
+      Logger.log("  ✍️ Mensaje exacto inyectado en 'Observaciones' de la fila " + (filaVentaIdx + 1));
+    }
+  }
+  
+  Logger.log("==================================================================");
+  Logger.log("🏁 FIN DE LA TRAZA COMPLETA");
+  Logger.log("==================================================================");
+}
+
+// ==========================================
+// FUNCIÓN DE AFECTACIÓN CONTABLE DIRECTA ("Operacion y control")
+// ==========================================
+function aplicarAfectacionCaja_(ss, hojaA, colA, stockActual, filaVenta, colV, idVenta) {
+  Logger.log("\n[FASE 6] Actualizando valores sobre la fila de 'Operacion y control' en Arqueo_caja...");
+
+  const datosA = hojaA.getDataRange().getValues();
+  const idxTipoReg = colA["tipo_registro"];
+  
+  if (idxTipoReg === undefined) {
+    Logger.log("❌ ERROR: No se encontró la columna 'tipo_registro' en Arqueo_caja.");
+    return;
+  }
+
+  // Buscar la fila exacta que contenga "Operacion y control"
+  let filaOperacionIdx = -1;
+  for (let r = 1; r < datosA.length; r++) {
+    const tipoVal = String(datosA[r][idxTipoReg] || "").trim().toLowerCase();
+    if (tipoVal === "operacion y control") {
+      filaOperacionIdx = r + 1; // Fila real en Google Sheets (1-indexada)
+      break;
+    }
+  }
+
+  if (filaOperacionIdx === -1) {
+    Logger.log("❌ ERROR: No se encontró ninguna fila con el tipo_registro 'Operacion y control' en Arqueo_caja.");
+    return;
+  }
+
+  Logger.log("  → Fila 'Operacion y control' encontrada en la línea N° " + filaOperacionIdx);
+
+  // Actualizar directamente sumando cant y restando Dev en esa misma fila
+  MAPA_DENOMS.forEach(d => {
+    const idxCantVenta = colV[d.colCant.toLowerCase()];
+    const idxDevVenta = colV[d.colDev.toLowerCase()];
+
+    const ingresa = (idxCantVenta !== undefined) ? (Number(filaVenta[idxCantVenta]) || 0) : 0;
+    const sale = (idxDevVenta !== undefined) ? (Number(filaVenta[idxDevVenta]) || 0) : 0;
+
+    const colCantIdx = colA[d.colCant.toLowerCase()];
+    if (colCantIdx !== undefined) {
+      const valorActualEnCaja = Number(hojaA.getRange(filaOperacionIdx, colCantIdx + 1).getValue()) || 0;
+      
+      let nuevoValor = valorActualEnCaja + ingresa - sale;
+      if (nuevoValor < 0) nuevoValor = 0; // Blindaje contra negativos
+
+      hojaA.getRange(filaOperacionIdx, colCantIdx + 1).setValue(nuevoValor);
+      Logger.log("    * " + d.colCant + ": Anterior(" + valorActualEnCaja + ") + Ingresa(" + ingresa + ") - Sale(" + sale + ") = Nuevo Total(" + nuevoValor + ")");
+    }
+  });
+
+  Logger.log("  ✨ ¡Fila de 'Operacion y control' actualizada con éxito!");
+}
+
+// ==========================================
+// FUNCIÓN AUXILIAR DE MAPEO
+// ==========================================
+function mapaEncabezados_(encabezados) {
+  const m = {};
+  encabezados.forEach((h, i) => {
+    const k = String(h == null ? "" : h).normalize("NFC").trim().toLowerCase();
+    if (k && m[k] === undefined) m[k] = i;
+  });
+  return m;
+}
+
+Edited By:
+
+Fabio Alfonso Ávila Bueno
+18 de Noviembre de 2026
+7:30pm
