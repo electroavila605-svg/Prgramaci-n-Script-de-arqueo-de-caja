@@ -40,7 +40,11 @@ stock y permite reintentar).
   se escribe en la venta: Estado "Pendiente", motivo en Observaciones. La 2.0
   fallaba en silencio.
 - Si otro proceso tiene la caja, la venta se marca con "Pulse Pagar de nuevo".
-
+-Aun no se ha logrado que el script interprete equivalencias entre billetes,
+es decir aun no detecta que un billlete de "X"  puede reemplazarse por
+2 billetes de la denominacion "Y" o 4 de la denominacion "Z", no se ha logrado
+llegar a ese nivel de equvalencia.
+Este fallo se detecto en la prueba #16 del sistema el 20 de nov
 **Velocidad**
 - Lee solo la última fila de `Filtro_caja_2`, busca la venta de abajo hacia
   arriba y lee solo las últimas filas del arqueo (antes se leían las hojas
