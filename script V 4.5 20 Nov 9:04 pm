@@ -1,0 +1,550 @@
+Estre script V 4.5 Tiene todo funcionando hasta el borrador de la nota de como se hizo el cambio la actual es la siguiente:
+
+Nota: Se realizo el cambio tal como se solicito. Se entregaron: 1 x $1.000.
+
+la idea final es que la nota del cambio sea la que se describe a continuación: 
+
+"Nota de auditoría: Se cambió 1x$2000 por: 2x$1000 para entregar el cambio al cliente"
+
+A continuación se presenta la última versión del script: 4.5
+
+// ==========================================================
+// ARQUEO DE CAJA - VERSION 4.5
+// Un solo archivo. Si hay otros archivos con codigo en el proyecto, vacielos.
+//
+// FLUJO
+//  1) AppSheet: boton Pagar -> Estado="Pagado", Estado_arqueo="Por procesar"
+//  2) El bot detecta Estado Pendiente -> Pagado y llama al webhook (doPost)
+//  3) El script toma la venta (ultima fila de Filtro_caja_2), valida y:
+//     - Stock suficiente: suma lo recibido, resta las Dev_, Estado_arqueo="Procesado"
+//       (si la venta venia de un error de stock, deja en Observaciones una Nota con el
+//        cambio entregado: "Se realizo el cambio tal como se solicito...")
+//     - Stock insuficiente: NO toca la caja, Estado="Pendiente",
+//       Observaciones con el faltante y una sugerencia, Estado_arqueo="Procesado"
+//  4) El operador corrige Arqueo_caja y pulsa Pagar otra vez (repetible)
+// ==========================================================
+
+// ---------- CONFIGURACION ----------
+const VERSION = "4.5";
+const TOKEN_CANAL = "LLEGÓ";            // debe ser igual al token del cuerpo del bot
+const HOJA_VENTAS = "Ventas";
+const HOJA_ARQUEO = "Arqueo_caja";
+const HOJA_FILTRO = "Filtro_caja_2";
+const HOJA_LOG = "Log";
+// ID de tu Google Sheet (el texto largo entre /d/ y /edit en la URL).
+// Se usa cuando el script NO esta dentro de la hoja (script independiente o web app).
+const ID_SPREADSHEET = "1NDOgowtX4icTF6qJhgUAmAYaTsQl1AA6uzHbD4Qknks";
+const TIPO_ARQUEO = "Operacion y control";
+
+const EST_PENDIENTE = "Pendiente";
+const EST_PAGADO = "Pagado";
+const ARQ_POR_PROCESAR = "Por procesar";
+const ARQ_PROCESADO = "Procesado";
+
+const VALIDAR_BILLETES_VS_EFECTIVO = true; // cant_ debe sumar el Efectivo
+const TOLERANCIA_DEV = 100;                // Dev_ puede diferir del Cambio en menos de $100 (redondeo)
+const VENTANA_VENTAS = 300;                // ultimas filas de Ventas donde se busca primero
+const VENTANA_ARQUEO = 40;                 // ultimas filas de Arqueo_caja donde se busca primero
+const AJUSTAR_VUELTO_AL_STOCK = false;    // OPCIONAL (apagado): si faltan piezas de Dev_, recompone el vuelto con lo que hay en caja
+const MAX_PIEZAS_EXTRA = 3;                // (solo si AJUSTAR_VUELTO_AL_STOCK=true) maximo de piezas de mas que Dev_
+const LIMITE_CAMBIO = 1000000;             // tope de seguridad para el calculo de recomposicion
+const ESPERA_BLOQUEO_MS = 20000;
+const DEBUG = false;                       // true = escribe trazas en Logger
+
+const MAPA_DENOMS = [
+  { label: "$100.000", valor: 100000, colCant: "cant_100k",  colDev: "Dev_100k"  },
+  { label: "$50.000",  valor: 50000,  colCant: "cant_50k",   colDev: "Dev_50k"   },
+  { label: "$20.000",  valor: 20000,  colCant: "cant_20k",   colDev: "Dev_20k"   },
+  { label: "$10.000",  valor: 10000,  colCant: "cant_10k",   colDev: "Dev_10k"   },
+  { label: "$5.000",   valor: 5000,   colCant: "cant_5k",    colDev: "Dev_5k"    },
+  { label: "$2.000",   valor: 2000,   colCant: "cant_2k",    colDev: "Dev_2k"    },
+  { label: "$1.000",   valor: 1000,   colCant: "cant_1000m", colDev: "Dev_1000m" },
+  { label: "$500",     valor: 500,    colCant: "cant_500m",  colDev: "Dev_500m"  },
+  { label: "$200",     valor: 200,    colCant: "cant_200m",  colDev: "Dev_200m"  },
+  { label: "$100",     valor: 100,    colCant: "cant_100m",  colDev: "Dev_100m"  }
+];
+// claves en minuscula calculadas una sola vez
+const DENOMS = MAPA_DENOMS.map(d => Object.assign({}, d, {
+  kCant: d.colCant.toLowerCase(),
+  kDev: d.colDev.toLowerCase()
+}));
+
+// ==========================================================
+// PUNTOS DE ENTRADA
+// ==========================================================
+
+// Abrir la URL /exec en el navegador: debe decir la version desplegada.
+function doGet() {
+  return salida_("Arqueo de caja - version " + VERSION + " activa");
+}
+
+// Webhook del bot de AppSheet. Cuerpo minimo: {"token":"LLEGÓ"}
+function doPost(e) {
+  let datos = {};
+  try {
+    datos = JSON.parse((e && e.postData && e.postData.contents) || "{}");
+  } catch (err) {
+    registrarLog_("webhook", "", "JSON mal formado", 0);
+    return salida_("error: JSON mal formado");
+  }
+  const token = normalizarTexto_(datos.token || datos.Token);
+  if (token !== normalizarTexto_(TOKEN_CANAL)) {
+    registrarLog_("webhook", "", "token invalido", 0);
+    return salida_("error: token invalido");
+  }
+  return salida_(procesarVentaPagada_("webhook", ""));
+}
+
+// Prueba manual desde el editor: procesa la ultima fila de Filtro_caja_2.
+// Tambien REINTENTA una venta que fallo por stock (Estado="Pendiente", Estado_arqueo="Procesado")
+// despues de que corrija Arqueo_caja, sin tener que editar nada a mano.
+// Una venta ya cerrada con exito nunca se procesa dos veces.
+function probarManual() {
+  const r = procesarVentaPagada_("manual", "", { reintento: true });
+  Logger.log(r);
+  try { abrirLibro_().toast(r, "Arqueo v" + VERSION, 10); } catch (e) {}
+}
+
+// ==========================================================
+// ENVOLTORIO: bloqueo, errores, registro
+// ==========================================================
+function procesarVentaPagada_(origen, idForzado, opciones) {
+  const t0 = Date.now();
+  const S = { origen: origen, id: idForzado || "", fila: 0, hojaV: null, colV: null,
+              reintento: !!(opciones && opciones.reintento) };
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(ESPERA_BLOQUEO_MS)) {
+    // Nadie reintenta solo: se avisa en la venta para que pulse Pagar otra vez.
+    const msg = "La caja estaba ocupada procesando otra operacion. Pulse Pagar de nuevo.";
+    try {
+      const loc = localizar_(S, abrirLibro_());
+      if (normalizarTexto_(loc.fv[loc.cV["estado_arqueo"]]) === normalizarTexto_(ARQ_POR_PROCESAR)) marcarFallo_(S, msg);
+    } catch (e0) {}
+    const r = "ocupado: " + msg;
+    registrarLog_(origen, S.id, r, Date.now() - t0);
+    return r;
+  }
+
+  let resultado;
+  try {
+    resultado = nucleo_(S);
+  } catch (err) {
+    const msg = (err && err.esFalla)
+      ? err.mensaje
+      : "ERROR TECNICO: " + (err && err.message ? err.message : String(err));
+    try { marcarFallo_(S, msg); } catch (e2) { /* ya no hay mas que hacer */ }
+    resultado = "fallo: " + msg;
+  } finally {
+    try { SpreadsheetApp.flush(); } catch (e3) {}
+    lock.releaseLock();
+  }
+  registrarLog_(origen, S.id, resultado, Date.now() - t0);
+  return resultado;
+}
+
+// ==========================================================
+// NUCLEO
+// ==========================================================
+// Ubica la venta (ultima fila de Filtro_caja_2) y deja S listo para poder marcarla.
+function localizar_(S, ss) {
+  const hojaV = ss.getSheetByName(HOJA_VENTAS);
+  if (!hojaV) throw falla_("No existe la hoja '" + HOJA_VENTAS + "'.");
+  const hv = leerEncabezados_(hojaV);
+  const cV = hv.col;
+  if (cV["id_venta"] === undefined) throw falla_("Ventas no tiene la columna Id_Venta.");
+
+  if (!S.id) S.id = leerUltimoIdFiltro_(ss);
+  const fila = buscarFilaPorId_(hojaV, cV["id_venta"] + 1, hojaV.getLastRow(), S.id);
+  if (!fila) throw falla_("No encontre la venta '" + S.id + "' en Ventas.");
+  S.fila = fila; S.hojaV = hojaV; S.colV = cV;
+  const fv = hojaV.getRange(fila, 1, 1, hv.lc).getValues()[0];
+
+  ["estado", "observaciones", "estado_arqueo"].forEach(k => {
+    if (cV[k] === undefined) throw falla_("Ventas no tiene la columna '" + k + "'.");
+  });
+  return { hv: hv, cV: cV, fv: fv };
+}
+
+function nucleo_(S) {
+  const ss = abrirLibro_();
+  const tz = ss.getSpreadsheetTimeZone();
+
+  const loc = localizar_(S, ss);
+  const cV = loc.cV, hv = loc.hv, fv = loc.fv;
+
+  // --- Solo procesa lo que esta "Por procesar" (evita doble descuento) ---
+  // Excepcion (solo prueba manual): reintento de una venta que fallo por stock.
+  const marca = normalizarTexto_(fv[cV["estado_arqueo"]]);
+  const estadoAct = normalizarTexto_(fv[cV["estado"]]);
+  const esReintento = S.reintento
+    && marca === normalizarTexto_(ARQ_PROCESADO)
+    && estadoAct === normalizarTexto_(EST_PENDIENTE);
+  if (marca !== normalizarTexto_(ARQ_POR_PROCESAR) && !esReintento) {
+    return "ignorado: la venta " + S.id + " tiene Estado='" + estadoAct + "' y Estado_arqueo='" + marca + "'";
+  }
+
+  // --- Columnas necesarias en Ventas ---
+  const faltan = [];
+  ["medio_de_pago", "efectivo", "cambio"]
+    .concat(DENOMS.map(d => d.kCant), DENOMS.map(d => d.kDev))
+    .forEach(k => { if (cV[k] === undefined) faltan.push(k); });
+  if (faltan.length) throw falla_("Faltan columnas en Ventas: " + faltan.join(", ") + ".");
+
+  // --- Medio de pago ---
+  const medio = normalizarTexto_(fv[cV["medio_de_pago"]]);
+  if (!medio) throw falla_("Medio_de_pago esta vacio.");
+  if (medio.indexOf("efect") === -1) {
+    cerrarOk_(S, fv);
+    return "ok: venta " + S.id + " (no efectivo), caja sin cambios";
+  }
+
+  // --- Lectura y validacion de numeros ---
+  const efectivo = numero_(fv[cV["efectivo"]]);
+  const cambio = numero_(fv[cV["cambio"]]);
+  if (isNaN(efectivo) || isNaN(cambio)) throw falla_("Efectivo o Cambio no son numeros.");
+  if (cambio < 0) throw falla_("El Cambio es negativo ($" + miles_(cambio) + "): el efectivo es menor al total.");
+
+  const cant = [], dev = [];
+  let sumCant = 0, sumDev = 0;
+  for (let i = 0; i < DENOMS.length; i++) {
+    const d = DENOMS[i];
+    const a = numero_(fv[cV[d.kCant]]);
+    const b = numero_(fv[cV[d.kDev]]);
+    if (isNaN(a) || a < 0 || a !== Math.floor(a)) throw falla_("Valor invalido en " + d.colCant + ".");
+    if (isNaN(b) || b < 0 || b !== Math.floor(b)) throw falla_("Valor invalido en " + d.colDev + ".");
+    cant.push(a); dev.push(b);
+    sumCant += a * d.valor; sumDev += b * d.valor;
+  }
+  if (VALIDAR_BILLETES_VS_EFECTIVO && sumCant !== efectivo) {
+    throw falla_("Los billetes recibidos (cant_) suman $" + miles_(sumCant) + " pero el Efectivo es $" + miles_(efectivo) + ". Corrija y pulse Pagar de nuevo.");
+  }
+  if (Math.abs(sumDev - cambio) >= TOLERANCIA_DEV) {
+    throw falla_("Las piezas a devolver (Dev_) suman $" + miles_(sumDev) + " pero el Cambio es $" + miles_(cambio) + ". Revise la formula de Dev_.");
+  }
+
+  // --- Arqueo de HOY ---
+  const hojaA = ss.getSheetByName(HOJA_ARQUEO);
+  if (!hojaA) throw falla_("No existe la hoja '" + HOJA_ARQUEO + "'.");
+  const ha = leerEncabezados_(hojaA);
+  const cA = ha.col;
+  const faltanA = [];
+  ["fecha", "tipo_registro"].concat(DENOMS.map(d => d.kCant))
+    .forEach(k => { if (cA[k] === undefined) faltanA.push(k); });
+  if (faltanA.length) throw falla_("Faltan columnas en Arqueo_caja: " + faltanA.join(", ") + ".");
+
+  const arq = buscarFilaArqueoHoy_(hojaA, ha, tz);
+  if (!arq) throw falla_("No existe la fila de arqueo de HOY (tipo '" + TIPO_ARQUEO + "'). Creela y pulse Pagar de nuevo.");
+
+  const stock = DENOMS.map(d => numero_(arq.valores[cA[d.kCant]]) || 0);
+
+  // --- Stock suficiente? (solo con lo que ya estaba en caja) ---
+  // Regla normal: las piezas de Dev_ deben existir tal cual en caja. Si no, error con el
+  // faltante y una sugerencia; el operador corrige Arqueo_caja y reintenta.
+  let entrega = dev;
+  let nota = "";
+  const faltasDev = [];
+  for (let i = 0; i < DENOMS.length; i++) {
+    if (dev[i] > 0 && stock[i] < dev[i]) faltasDev.push({ i: i, falta: dev[i] - stock[i] });
+  }
+
+  if (faltasDev.length) {
+    let recompuesto = null;                       // opcional, apagado por defecto
+    if (AJUSTAR_VUELTO_AL_STOCK) {
+      if (sumDev > LIMITE_CAMBIO) throw falla_("El vuelto ($" + miles_(sumDev) + ") supera el limite de seguridad.");
+      const rec = calcularVuelto_(sumDev, stock);
+      const suma = arr => arr.reduce((x, y) => x + y, 0);
+      if (rec.faltante.every(m => m === 0) && (suma(rec.entrega) - suma(dev)) <= MAX_PIEZAS_EXTRA) recompuesto = rec.entrega;
+    }
+    if (!recompuesto) {
+      marcarFallo_(S, mensajeStock_(stock, faltasDev));
+      return "stock insuficiente en venta " + S.id;
+    }
+    entrega = recompuesto;
+    nota = "Nota: La caja no tenia las piezas de cambio solicitadas (" + piezas_(dev) + "). " +
+           "En su lugar se entregaron (" + piezas_(entrega) + ").";
+  } else if (normalizarTexto_(fv[cV["observaciones"]]).indexOf("stock insuficiente") === 0) {
+    // Reintento exitoso despues de un error de stock: se deja constancia del cambio entregado.
+    nota = "Nota: Se realizo el cambio tal como se solicito. Se entregaron: " + piezas_(entrega) + ".";
+  }
+
+  // --- Escenario 1: actualizar caja (stock + recibido - entregado) ---
+  const nuevo = stock.map((s, i) => s + cant[i] - entrega[i]);
+  const idx = DENOMS.map(d => cA[d.kCant]);
+  let contiguas = true;
+  for (let i = 1; i < idx.length; i++) if (idx[i] !== idx[0] + i) contiguas = false;
+  if (contiguas) {
+    hojaA.getRange(arq.fila, idx[0] + 1, 1, idx.length).setValues([nuevo]);
+  } else {
+    for (let i = 0; i < idx.length; i++) hojaA.getRange(arq.fila, idx[i] + 1).setValue(nuevo[i]);
+  }
+  cerrarOk_(S, fv, nota);
+  return "ok: venta " + S.id + " procesada" + (nota ? " (vuelto ajustado al stock)" : "") + "; caja actualizada (fila " + arq.fila + ")";
+}
+
+// ==========================================================
+// ESCRITURA EN VENTAS (solo celdas puntuales, sin pisar formulas)
+// ==========================================================
+function cerrarOk_(S, fv, nota) {
+  const c = S.colV, h = S.hojaV;
+  const obsNueva = nota || "";
+  const obsActual = String(fv[c["observaciones"]] == null ? "" : fv[c["observaciones"]]);
+  if (obsActual !== obsNueva) h.getRange(S.fila, c["observaciones"] + 1).setValue(obsNueva);
+  if (normalizarTexto_(fv[c["estado"]]) !== normalizarTexto_(EST_PAGADO)) {
+    h.getRange(S.fila, c["estado"] + 1).setValue(EST_PAGADO);
+  }
+  h.getRange(S.fila, c["estado_arqueo"] + 1).setValue(ARQ_PROCESADO);
+}
+
+function marcarFallo_(S, msg) {
+  if (!S.fila || !S.hojaV || !S.colV) return; // aun no se sabe cual fila marcar
+  const c = S.colV, h = S.hojaV;
+  const ce = c["estado"], co = c["observaciones"], cq = c["estado_arqueo"];
+  if (ce !== undefined && co !== undefined && Math.abs(ce - co) === 1) {
+    h.getRange(S.fila, Math.min(ce, co) + 1, 1, 2)
+      .setValues(ce < co ? [[EST_PENDIENTE, msg]] : [[msg, EST_PENDIENTE]]);
+  } else {
+    if (ce !== undefined) h.getRange(S.fila, ce + 1).setValue(EST_PENDIENTE);
+    if (co !== undefined) h.getRange(S.fila, co + 1).setValue(msg);
+  }
+  if (cq !== undefined) h.getRange(S.fila, cq + 1).setValue(ARQ_PROCESADO);
+}
+
+// ==========================================================
+// RECOMPOSICION DEL VUELTO CON EL STOCK REAL
+// Devuelve, para un monto, la entrega con MENOS piezas usando solo lo que hay en caja.
+// Si no alcanza, "faltante" dice cuantas piezas (las menos posibles) harian falta.
+// ==========================================================
+function calcularVuelto_(monto, stock) {
+  const u = Math.round(monto / 100);               // todo en unidades de $100
+  const D = DENOMS.length, FALTA = 100000;         // costo de una pieza que no existe (nunca conviene)
+  const INF = 1e12;
+  let dp = new Array(u + 1).fill(INF); dp[0] = 0;
+  const kReal = [], via = [];
+  for (let i = 0; i < D; i++) {
+    const v = DENOMS[i].valor / 100;
+    const A = new Array(u + 1).fill(INF), K = new Array(u + 1).fill(0);
+    for (let a = 0; a <= u; a++) {
+      const maxK = Math.min(stock[i], Math.floor(a / v));
+      for (let k = 0; k <= maxK; k++) {
+        const c = dp[a - k * v] + k;
+        if (c < A[a]) { A[a] = c; K[a] = k; }
+      }
+    }
+    const B = A.slice(), Vi = new Array(u + 1).fill(0);
+    for (let a = v; a <= u; a++) {
+      const c = B[a - v] + FALTA;
+      if (c < B[a]) { B[a] = c; Vi[a] = 1; }
+    }
+    kReal.push(K); via.push(Vi); dp = B;
+  }
+  const entrega = new Array(D).fill(0), faltante = new Array(D).fill(0);
+  let a = u;
+  for (let i = D - 1; i >= 0; i--) {
+    const v = DENOMS[i].valor / 100;
+    while (via[i][a] === 1) { faltante[i]++; a -= v; }
+    entrega[i] = kReal[i][a]; a -= entrega[i] * v;
+  }
+  return { entrega: entrega, faltante: faltante };
+}
+
+// "1 x $10.000, 1 x $5.000"
+function piezas_(arr) {
+  const p = [];
+  arr.forEach((q, i) => { if (q > 0) p.push(q + " x $" + miles_(DENOMS[i].valor)); });
+  return p.length ? p.join(", ") : "nada";
+}
+
+// ==========================================================
+// MENSAJE SUGERIDO CUANDO FALTA STOCK (no es literal, es una guia)
+// ==========================================================
+function mensajeStock_(stock, faltas) {
+  let valorFalta = 0;
+  const partes = [];
+  const cortas = {};
+  faltas.forEach(f => {
+    valorFalta += f.falta * DENOMS[f.i].valor;
+    partes.push(f.falta + " x $" + miles_(DENOMS[f.i].valor));
+    cortas[f.i] = true;
+  });
+  let msg = "STOCK INSUFICIENTE EN CAJA. Faltan: " + partes.join(", ") + " (total $" + miles_(valorFalta) + ").";
+
+  // pieza de caja a cambiar: la menor que cubra el faltante y no sea de las que faltan
+  let b = -1;
+  for (let i = DENOMS.length - 1; i >= 0; i--) {
+    if (stock[i] > 0 && !cortas[i] && DENOMS[i].valor >= valorFalta) { b = i; break; }
+  }
+  if (b < 0) {
+    return msg + "\nSUGERIDO: no hay en caja una pieza que cubra ese valor. Reponga las piezas faltantes en Arqueo_caja y pulse Pagar de nuevo.";
+  }
+
+  // lo que devolveria la caja mayor: las piezas faltantes + el excedente en menudo
+  const pedir = {};
+  faltas.forEach(f => { pedir[f.i] = (pedir[f.i] || 0) + f.falta; });
+  let resto = DENOMS[b].valor - valorFalta;
+  for (let i = b + 1; i < DENOMS.length && resto > 0; i++) {
+    const q = Math.floor(resto / DENOMS[i].valor);
+    if (q > 0) { pedir[i] = (pedir[i] || 0) + q; resto -= q * DENOMS[i].valor; }
+  }
+  const lista = Object.keys(pedir).map(Number).sort((x, y) => x - y)
+    .map(i => pedir[i] + " x $" + miles_(DENOMS[i].valor)).join(", ");
+
+  return msg +
+    "\nSUGERIDO (ajustelo a su criterio):" +
+    "\n1. Cambie en caja mayor 1 x $" + miles_(DENOMS[b].valor) + " por: " + lista + "." +
+    "\n2. Registre ese cambio en Arqueo_caja." +
+    "\n3. Pulse Pagar de nuevo.";
+}
+
+// ==========================================================
+// LECTURAS ACOTADAS (rapidas: no leen todo el historial)
+// ==========================================================
+function leerEncabezados_(hoja) {
+  const lc = hoja.getLastColumn();
+  const enc = hoja.getRange(1, 1, 1, lc).getValues()[0];
+  return { lc: lc, col: mapaEncabezados_(enc) };
+}
+
+// Ultimo id no vacio de Filtro_caja_2 (mira solo las ultimas 20 filas).
+function leerUltimoIdFiltro_(ss) {
+  const hoja = ss.getSheetByName(HOJA_FILTRO);
+  if (!hoja) throw falla_("No existe la hoja '" + HOJA_FILTRO + "'.");
+  const lr = hoja.getLastRow();
+  if (lr < 2) throw falla_("Filtro_caja_2 esta vacia.");
+  const hf = leerEncabezados_(hoja);
+  if (hf.col["id_venta"] === undefined) throw falla_("Filtro_caja_2 no tiene la columna Id_Venta.");
+  const ini = Math.max(2, lr - 19);
+  const vals = hoja.getRange(ini, hf.col["id_venta"] + 1, lr - ini + 1, 1).getValues();
+  for (let i = vals.length - 1; i >= 0; i--) {
+    const id = String(vals[i][0] == null ? "" : vals[i][0]).trim();
+    if (id) return id;
+  }
+  throw falla_("Filtro_caja_2 no tiene ningun Id_Venta.");
+}
+
+// Busca de abajo hacia arriba: primero en la ventana final, luego en el resto.
+function buscarFilaPorId_(hoja, colNum, lastRow, id) {
+  if (lastRow < 2) return 0;
+  const buscar = (desde, hasta) => {
+    const ids = hoja.getRange(desde, colNum, hasta - desde + 1, 1).getValues();
+    for (let i = ids.length - 1; i >= 0; i--) {
+      if (String(ids[i][0] == null ? "" : ids[i][0]).trim() === id) return desde + i;
+    }
+    return 0;
+  };
+  const ini = Math.max(2, lastRow - VENTANA_VENTAS + 1);
+  let f = buscar(ini, lastRow);
+  if (!f && ini > 2) f = buscar(2, ini - 1);
+  return f;
+}
+
+// Fila de HOY, tipo "Operacion y control", con la hora mas reciente.
+function buscarFilaArqueoHoy_(hojaA, ha, tz) {
+  const lr = hojaA.getLastRow();
+  if (lr < 2) return null;
+  const cA = ha.col;
+  const hoy = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+  const tipoObj = normalizarTexto_(TIPO_ARQUEO);
+
+  const escanear = (ini) => {
+    const vals = hojaA.getRange(ini, 1, lr - ini + 1, ha.lc).getValues();
+    let mejor = null;
+    for (let i = 0; i < vals.length; i++) {
+      const f = vals[i];
+      if (normalizarTexto_(f[cA["tipo_registro"]]) !== tipoObj) continue;
+      if (convertirFechaAKey_(f[cA["fecha"]], tz) !== hoy) continue;
+      const seg = cA["hora"] !== undefined ? convertirHoraASegundos_(f[cA["hora"]], tz) : 0;
+      if (!mejor || seg >= mejor.seg) mejor = { fila: ini + i, valores: f, seg: seg };
+    }
+    return mejor;
+  };
+
+  const ini = Math.max(2, lr - VENTANA_ARQUEO + 1);
+  let r = escanear(ini);
+  if (!r && ini > 2) r = escanear(2);
+  return r;
+}
+
+// ==========================================================
+// REGISTRO (una sola linea por ejecucion)
+// ==========================================================
+function registrarLog_(origen, id, resultado, ms) {
+  if (DEBUG) Logger.log("[" + origen + "] " + id + " -> " + resultado + " (" + ms + " ms)");
+  try {
+    const h = abrirLibro_().getSheetByName(HOJA_LOG);
+    if (h) h.appendRow([new Date(), origen, id, resultado, ms]);
+  } catch (e) { /* el log nunca debe romper el proceso */ }
+}
+
+// ==========================================================
+// AUXILIARES
+// ==========================================================
+let _libro = null;
+function abrirLibro_() {
+  if (_libro) return _libro;
+  let ss = null;
+  try { ss = SpreadsheetApp.getActive(); } catch (e) { ss = null; }   // script dentro de la hoja
+  if (!ss) ss = SpreadsheetApp.openById(ID_SPREADSHEET);              // script independiente
+  _libro = ss;
+  return ss;
+}
+
+function falla_(mensaje) { return { esFalla: true, mensaje: mensaje }; }
+
+function salida_(texto) {
+  return ContentService.createTextOutput(texto).setMimeType(ContentService.MimeType.TEXT);
+}
+
+function numero_(v) {
+  if (v === "" || v == null) return 0;
+  const n = Number(v);
+  return isNaN(n) ? NaN : n;
+}
+
+function miles_(n) {
+  return String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+}
+
+function normalizarTexto_(val) {
+  return String(val == null ? "" : val)
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+function mapaEncabezados_(encabezados) {
+  const m = {};
+  encabezados.forEach((h, i) => {
+    const k = String(h == null ? "" : h).normalize("NFC").trim().toLowerCase();
+    if (k && m[k] === undefined) m[k] = i;
+  });
+  return m;
+}
+
+function convertirFechaAKey_(valorFecha, tz) {
+  if (!valorFecha) return "";
+  if (Object.prototype.toString.call(valorFecha) === "[object Date]" && !isNaN(valorFecha.getTime())) {
+    return Utilities.formatDate(valorFecha, tz, "yyyy-MM-dd");
+  }
+  const texto = String(valorFecha).trim();
+  const p = texto.split("/");
+  if (p.length === 3) {
+    return p[2].substring(0, 4) + "-" + p[1].padStart(2, "0") + "-" + p[0].padStart(2, "0");
+  }
+  return texto;
+}
+
+function convertirHoraASegundos_(valorHora, tz) {
+  if (!valorHora) return 0;
+  if (Object.prototype.toString.call(valorHora) === "[object Date]" && !isNaN(valorHora.getTime())) {
+    return parseHHMMSS_(Utilities.formatDate(valorHora, tz, "HH:mm:ss"));
+  }
+  return parseHHMMSS_(String(valorHora).trim());
+}
+
+function parseHHMMSS_(str) {
+  const m = str.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return 0;
+  return (Number(m[1]) || 0) * 3600 + (Number(m[2]) || 0) * 60 + (Number(m[3]) || 0);
+}
